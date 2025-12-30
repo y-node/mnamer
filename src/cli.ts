@@ -104,5 +104,137 @@ async function walkPaths(
                 // skip walking the target directory
                 continue;
               }
-              const nested = await walkPaths([fp], recursive, target*`
-
+              const nested = await walkPaths([fp], recursive, targetDir);
+              results.push(...nested);
+            }
+          } catch {
+            // ignore individual entry errors
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`Skipping path ${p}: ${String(err)}`);
+    }
+  }
+
+  return results;
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+
+  // Resolve sources now so we can compute relative paths against them when
+  // mirroring directory structure into the target root. The sources themselves
+  // should not become part of the target path — we mirror their children.
+  // Treat file inputs as their parent directory so we only keep directory roots.
+  const resolvedSourcesRaw = await Promise.all(
+    args.sources.map(async (s) => {
+      const abs = path.resolve(s);
+      try {
+        const st = await fs.stat(abs);
+        if (st.isDirectory()) return abs;
+        if (st.isFile()) return path.dirname(abs);
+      } catch {
+        // Skip non-existent / unreadable sources
+      }
+      return null;
+    })
+  );
+
+  // Filter out nulls and deduplicate
+  const resolvedSources = Array.from(
+    new Set(resolvedSourcesRaw.filter((v): v is string => !!v))
+  );
+
+  // Precompute sources sorted by directory depth (most specific first)
+  const sortedResolvedSources = [...resolvedSources].sort(
+    (a, b) => b.split(path.sep).length - a.split(path.sep).length
+  );
+
+  /**
+   * Find the most specific (deepest) source path that is an ancestor of filePath.
+   * Returns null if none match.
+   */
+  function findBestSourceForFile(filePath: string): string | null {
+    const fileResolved = path.resolve(filePath);
+    for (const src of sortedResolvedSources) {
+      const srcResolved = path.resolve(src);
+      if (fileResolved === srcResolved || fileResolved.startsWith(srcResolved + path.sep)) {
+        return srcResolved;
+      }
+    }
+    return null;
+  }
+
+  // Walk using resolved sources so paths are absolute and consistent
+  const filePaths = await walkPaths(resolvedSources.length ? resolvedSources : args.sources, args.recursive, args.target);
+
+  if (filePaths.length === 0) {
+    console.log("No files found to process.");
+    return;
+  }
+
+  console.log(
+    args.apply
+      ? `Running in APPLY mode: files will be moved${args.target ? ` to ${args.target}` : " in-place"}.`
+      : `Running in DRY-RUN mode: no files will be changed. Use --apply to perform renames/moves.`
+  );
+
+  let processed = 0;
+  for (const file of filePaths) {
+    const basename = path.basename(file);
+    const parsed = parseFilename(basename);
+    if (!parsed) {
+      console.log(`Skipping (unparseable): ${file}`);
+      continue;
+    }
+    const newBasename = generateFilename(parsed);
+    if (newBasename === basename && !args.target) {
+      console.log(`No change: ${basename}`);
+      processed++;
+      continue;
+    }
+
+    // Compute destination directory. When a target root is provided and the file
+    // belongs to one of the declared source roots, preserve the file's relative
+    // directory structure under the target root (without adding the source root
+    // directory itself). If no matching source root is found, fall back to
+    // placing files directly in the target root.
+    let targetLocation: string;
+    if (args.target) {
+      const targetRoot = path.resolve(args.target);
+      const bestSource = findBestSourceForFile(file);
+      if (bestSource) {
+        const relDir = path.relative(bestSource, path.dirname(file)); // "" if in source root
+        targetLocation = relDir ? path.join(targetRoot, relDir) : targetRoot;
+      } else {
+        targetLocation = targetRoot;
+      }
+    } else {
+      targetLocation = path.dirname(file);
+    }
+
+    const destPath = path.join(targetLocation, newBasename);
+    console.log(`${file} -> ${destPath}`);
+    try {
+      await renameFile(file, newBasename, {
+        apply: args.apply,
+        dryRun: !args.apply,
+        replace: args.replace,
+        targetDir: targetLocation,
+      });
+      processed++;
+    } catch (err: any) {
+      console.error(`Failed to rename/move ${file}: ${err?.message ?? err}`);
+    }
+  }
+
+  console.log(`Processed ${processed} file(s).`);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}
